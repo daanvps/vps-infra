@@ -1,0 +1,38 @@
+name: Inspect VPS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the current VPS state
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            echo "=== running containers ==="
+            docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}'
+            echo
+            echo "=== who holds :80/:443 ==="
+            docker ps --format '{{.Names}}\t{{.Ports}}' | grep -E ':80->|:443->' || echo "(nobody)"
+            echo
+            echo "=== docker networks ==="
+            docker network ls --format '{{.Name}}'
+            echo
+            echo "=== existing certificates ==="
+            ls /etc/letsencrypt/live/ 2>/dev/null || echo "(cannot read; may need sudo)"
+            echo
+            echo "=== prayer room vhost server_names ==="
+            grep -hE 'server_name|ssl_certificate ' \
+              /home/deploy/prayerroom-app/deploy/nginx/default.conf 2>/dev/null \
+              || echo "(cannot read config)"
+            echo
+            echo "=== deploy dirs ==="
+            ls -1 /home/deploy/ 2>/dev/null

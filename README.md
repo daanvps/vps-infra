@@ -72,7 +72,13 @@ These are deliberate, and each one is load bearing:
 | `VPS_HOST` | VPS hostname or IP |
 | `VPS_USER` | SSH user |
 | `VPS_SSH_KEY` | SSH private key |
-| `VPS_INFRA_PATH` | directory on the VPS for this repo, e.g. `/home/deploy/vps-infra` |
+
+These are organization secrets on `daanvps`, shared by every repository that
+deploys to the VPS.
+
+The deploy directory defaults to `/home/deploy/vps-infra`. Override it with a
+repository or organization **variable** named `VPS_INFRA_PATH` if needed — a
+path is not a credential, so it is not a secret.
 
 This repository is public, so it must never contain keys, certificates or
 `.env` files.
