@@ -17,22 +17,15 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            echo "=== running containers ==="
-            docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}'
+            cd /home/deploy/vps-infra || exit 0
+            echo "=== containers ==="
+            docker ps -a --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
             echo
-            echo "=== who holds :80/:443 ==="
-            docker ps --format '{{.Names}}\t{{.Ports}}' | grep -E ':80->|:443->' || echo "(nobody)"
+            echo "=== proxy logs ==="
+            docker compose logs proxy --tail 40 2>&1 || docker logs edge-proxy --tail 40 2>&1
             echo
-            echo "=== docker networks ==="
-            docker network ls --format '{{.Name}}'
+            echo "=== conf.d on disk ==="
+            ls -la conf.d/ conf.d/include/ 2>&1
             echo
-            echo "=== existing certificates ==="
-            ls /etc/letsencrypt/live/ 2>/dev/null || echo "(cannot read; may need sudo)"
-            echo
-            echo "=== prayer room vhost server_names ==="
-            grep -hE 'server_name|ssl_certificate ' \
-              /home/deploy/prayerroom-app/deploy/nginx/default.conf 2>/dev/null \
-              || echo "(cannot read config)"
-            echo
-            echo "=== deploy dirs ==="
-            ls -1 /home/deploy/ 2>/dev/null
+            echo "=== certs ==="
+            ls /etc/letsencrypt/live/ 2>&1 || echo "(no read access)"
