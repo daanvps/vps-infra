@@ -82,14 +82,31 @@ jobs:
             # certbot has issued one.
             for conf in conf.d/*.conf; do
               [ "$(basename "$conf")" = "00-default.conf" ] && continue
-              domain=$(basename "$conf" .conf)
-              if [ ! -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]; then
-                echo "No certificate for $domain yet; parking its vhost."
+
+              # Only vhosts that actually reference a certificate can be broken
+              # by a missing one; plain HTTP vhosts are always safe to load.
+              cert=$(sed -n 's/^[[:space:]]*ssl_certificate[[:space:]]\+\([^;]*\);.*/\1/p' "$conf" | head -n1)
+              [ -n "$cert" ] || continue
+
+              if [ ! -f "$cert" ]; then
+                echo "Certificate $cert missing; parking $(basename "$conf")."
                 mv "$conf" "$conf.pending"
               fi
             done
 
             docker compose pull
+
+            # A site-specific nginx from before the shared proxy would still be
+            # holding :80/:443, so stand it down first. The proxy takes over in
+            # the same step, keeping the gap to a few seconds.
+            for legacy in prayerroom-nginx hartvoorelkaar-nginx; do
+              if [ -n "$(docker ps -q -f "name=^${legacy}$")" ]; then
+                echo "Stopping legacy proxy container $legacy"
+                docker stop "$legacy" >/dev/null
+                docker rm "$legacy" >/dev/null
+              fi
+            done
+
             docker compose up -d --remove-orphans
 
             # Wait for the proxy to answer before issuing challenges through it.
