@@ -114,10 +114,9 @@ jobs:
             # holding :80/:443, so stand it down first. The proxy takes over in
             # the same step, keeping the gap to a few seconds.
             for legacy in prayerroom-nginx hartvoorelkaar-nginx; do
-              if [ -n "$(docker ps -q -f "name=^${legacy}$")" ]; then
-                echo "Stopping legacy proxy container $legacy"
-                docker stop "$legacy" >/dev/null
-                docker rm "$legacy" >/dev/null
+              if [ -n "$(docker ps -aq -f "name=^${legacy}$")" ]; then
+                echo "Removing legacy proxy container $legacy"
+                docker rm -f "$legacy" >/dev/null
               fi
             done
 
