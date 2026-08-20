@@ -1,0 +1,115 @@
+name: Deploy edge proxy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      issue_certs:
+        description: 'Request certificates for domains that do not have one yet'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate the nginx configuration
+        run: |
+          set -euo pipefail
+
+          # Every vhost references a certificate that only exists on the VPS,
+          # so stub them out here purely to let nginx parse the config.
+          mkdir -p fake-le
+          for conf in conf.d/*.conf; do
+            case "$(basename "$conf")" in 00-default.conf) continue ;; esac
+            domain=$(basename "$conf" .conf)
+            mkdir -p "fake-le/live/$domain"
+            openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+              -keyout "fake-le/live/$domain/privkey.pem" \
+              -out "fake-le/live/$domain/fullchain.pem" \
+              -subj "/CN=$domain" 2>/dev/null
+            echo "  stubbed cert for $domain"
+          done
+
+          docker run --rm \
+            -v "$PWD/conf.d:/etc/nginx/conf.d:ro" \
+            -v "$PWD/fake-le:/etc/letsencrypt:ro" \
+            nginx:1.27-alpine nginx -t
+
+      - name: Copy the proxy configuration to the VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "docker-compose.yml,conf.d/**,scripts/**"
+          target: ${{ secrets.VPS_INFRA_PATH }}
+          overwrite: true
+
+      - name: Deploy the proxy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            cd ${{ secrets.VPS_INFRA_PATH }}
+
+            docker network inspect edge-net >/dev/null 2>&1 \
+              || docker network create edge-net
+
+            # A vhost whose certificate is missing would stop nginx from
+            # starting, taking every other site down with it. Park those until
+            # certbot has issued one.
+            for conf in conf.d/*.conf; do
+              [ "$(basename "$conf")" = "00-default.conf" ] && continue
+              domain=$(basename "$conf" .conf)
+              if [ ! -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]; then
+                echo "No certificate for $domain yet; parking its vhost."
+                mv "$conf" "$conf.pending"
+              fi
+            done
+
+            docker compose pull
+            docker compose up -d --remove-orphans
+
+            # Wait for the proxy to answer before issuing challenges through it.
+            for i in $(seq 1 30); do
+              curl -fsS -o /dev/null http://localhost/healthz && break
+              [ "$i" -eq 30 ] && { echo "proxy did not become healthy"; docker compose logs proxy; exit 1; }
+              sleep 1
+            done
+            echo "Proxy is healthy."
+
+            for pending in conf.d/*.conf.pending; do
+              [ -e "$pending" ] || continue
+              domain=$(basename "$pending" .conf.pending)
+
+              echo "Requesting a certificate for $domain"
+              if docker compose run --rm --entrypoint certbot certbot certonly \
+                    --webroot -w /var/www/certbot \
+                    -d "$domain" -d "www.$domain" \
+                    --non-interactive --agree-tos \
+                    --register-unsafely-without-email \
+                    --keep-until-expiring; then
+                mv "$pending" "conf.d/$domain.conf"
+                echo "Certificate issued for $domain."
+              else
+                echo "::warning::Could not obtain a certificate for $domain. \
+            Point the A records for $domain and www.$domain at this server, then \
+            re-run this workflow. Other sites are unaffected."
+              fi
+            done
+
+            docker compose exec -T proxy nginx -t
+            docker compose exec -T proxy nginx -s reload
+            echo "Active sites:"
+            ls conf.d/*.conf | xargs -n1 basename
