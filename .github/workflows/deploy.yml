@@ -80,16 +80,30 @@ jobs:
             # A vhost whose certificate is missing would stop nginx from
             # starting, taking every other site down with it. Park those until
             # certbot has issued one.
+            # /etc/letsencrypt is root owned, so list it through a container
+            # rather than testing paths as the deploy user, which cannot read it
+            # and would report every certificate as missing.
+            certs=$(docker run --rm -v /etc/letsencrypt:/etc/letsencrypt:ro \
+                      alpine sh -c 'ls /etc/letsencrypt/live 2>/dev/null' || true)
+            echo "Certificates present: ${certs:-<none>}"
+
+            # Restore anything parked by an earlier run before re-evaluating.
+            for pending in conf.d/*.conf.pending; do
+              [ -e "$pending" ] || continue
+              mv "$pending" "${pending%.pending}"
+            done
+
             for conf in conf.d/*.conf; do
               [ "$(basename "$conf")" = "00-default.conf" ] && continue
 
-              # Only vhosts that actually reference a certificate can be broken
-              # by a missing one; plain HTTP vhosts are always safe to load.
+              # Only vhosts that reference a certificate can be broken by a
+              # missing one; plain HTTP vhosts are always safe to load.
               cert=$(sed -n 's/^[[:space:]]*ssl_certificate[[:space:]]\+\([^;]*\);.*/\1/p' "$conf" | head -n1)
               [ -n "$cert" ] || continue
 
-              if [ ! -f "$cert" ]; then
-                echo "Certificate $cert missing; parking $(basename "$conf")."
+              name=$(basename "$conf" .conf)
+              if ! echo "$certs" | grep -qx "$name"; then
+                echo "No certificate for $name yet; parking its vhost."
                 mv "$conf" "$conf.pending"
               fi
             done
@@ -111,7 +125,7 @@ jobs:
 
             # Wait for the proxy to answer before issuing challenges through it.
             for i in $(seq 1 30); do
-              curl -fsS -o /dev/null http://localhost/healthz && break
+              curl -fsS -o /dev/null http://127.0.0.1/healthz && break
               [ "$i" -eq 30 ] && { echo "proxy did not become healthy"; docker compose logs proxy; exit 1; }
               sleep 1
             done
