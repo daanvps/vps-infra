@@ -74,7 +74,7 @@ jobs:
       - name: Report the current VPS state
         id: report
         continue-on-error: true
-        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         env:
           INFRA_PATH: ${{ env.INFRA_PATH }}
         with:
