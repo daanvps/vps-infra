@@ -1,7 +1,23 @@
 services:
   proxy:
-    image: nginx:1.27-alpine
+    # 1.27.5-alpine, pinned to the multi-arch index. Same bits as the
+    # previous floating 1.27-alpine tag on the day it was pinned.
+    image: nginx:1.27.5-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
     container_name: edge-proxy
+    # Upper ceilings. Docker charges the memory only while nginx uses it.
+    # Normal use sits far under 256m; the cap stops a leak or a log flood.
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: "0.75"
+    pids_limit: 128
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "80:80"
       - "443:443"
@@ -12,13 +28,20 @@ services:
     networks:
       - edge-net
     restart: unless-stopped
+    # Certbot's deploy hook touches .renewed. Polling once a minute keeps
+    # the reload cheap; nginx -s reload is graceful. The flag is removed
+    # only after a successful reload so a failed reload is retried.
     command: >
       sh -c 'nginx -g "daemon off;" &
              nginxpid=$${!};
              while :; do
-               sleep 6h;
+               sleep 60;
                if [ -f /var/www/certbot/.renewed ]; then
-                 rm -f /var/www/certbot/.renewed && nginx -s reload;
+                 if nginx -s reload; then
+                   rm -f /var/www/certbot/.renewed;
+                 else
+                   echo "nginx reload after renewal failed; will retry" >&2;
+                 fi;
                fi;
              done &
              wait $${nginxpid}'
@@ -30,19 +53,36 @@ services:
       start_period: 5s
 
   certbot:
-    image: certbot/certbot:latest
+    # v5.8.0, which is what certbot/certbot:latest resolved to when pinned.
+    image: certbot/certbot:v5.8.0@sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20
     container_name: edge-certbot
+    # Renewal is a short Python spike. 384m is headroom over that spike,
+    # and swap is off so a stuck renew cannot thrash the disk.
+    mem_limit: 384m
+    memswap_limit: 384m
+    cpus: "0.50"
+    pids_limit: 64
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - /etc/letsencrypt:/etc/letsencrypt
       - certbot-webroot:/var/www/certbot
     networks:
       - edge-net
     restart: unless-stopped
+    # Keep each shell command on one line. A deeper indent under ">",
+    # the YAML folded scalar, keeps the line break, and the shell then
+    # tries to execute "--deploy-hook" on its own.
     entrypoint: >
       sh -c 'trap exit TERM;
              while :; do
-               certbot renew --webroot -w /var/www/certbot --quiet --no-random-sleep-on-renew
-                 --deploy-hook "touch /var/www/certbot/.renewed";
+               certbot renew --webroot -w /var/www/certbot --quiet --no-random-sleep-on-renew --deploy-hook "touch /var/www/certbot/.renewed";
                sleep 12h & wait $${!};
              done'
 

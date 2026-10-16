@@ -10,8 +10,13 @@ on:
         type: boolean
         default: true
 
+# Checkout only. SSH uses repository secrets, not the token.
 permissions:
   contents: read
+
+concurrency:
+  group: deploy-edge-proxy
+  cancel-in-progress: false
 
 env:
   INFRA_PATH: /home/deploy/vps-infra
@@ -21,33 +26,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Validate the nginx configuration
-        run: |
-          set -euo pipefail
-
-          # Every vhost references a certificate that only exists on the VPS,
-          # so stub them out here purely to let nginx parse the config.
-          mkdir -p fake-le
-          for conf in conf.d/*.conf; do
-            case "$(basename "$conf")" in 00-default.conf) continue ;; esac
-            domain=$(basename "$conf" .conf)
-            mkdir -p "fake-le/live/$domain"
-            openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-              -keyout "fake-le/live/$domain/privkey.pem" \
-              -out "fake-le/live/$domain/fullchain.pem" \
-              -subj "/CN=$domain" 2>/dev/null
-            echo "  stubbed cert for $domain"
-          done
-
-          docker run --rm \
-            -v "$PWD/conf.d:/etc/nginx/conf.d:ro" \
-            -v "$PWD/fake-le:/etc/letsencrypt:ro" \
-            nginx:1.27-alpine nginx -t
+      - name: Validate Compose and nginx configuration
+        run: ./scripts/validate-config.sh
 
       - name: Prepare the VPS directory
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
@@ -55,7 +40,7 @@ jobs:
           script: mkdir -p ${{ vars.VPS_INFRA_PATH || env.INFRA_PATH }}/conf.d/include
 
       - name: Copy the proxy configuration to the VPS
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
@@ -65,11 +50,14 @@ jobs:
           overwrite: true
 
       - name: Deploy the proxy
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        env:
+          CERTBOT_EMAIL: ${{ secrets.CERTBOT_EMAIL || vars.CERTBOT_EMAIL }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          envs: CERTBOT_EMAIL
           script: |
             set -e
             cd ${{ vars.VPS_INFRA_PATH || env.INFRA_PATH }}
@@ -135,12 +123,26 @@ jobs:
               domain=$(basename "$pending" .conf.pending)
 
               echo "Requesting a certificate for $domain"
-              if docker compose run --rm --entrypoint certbot certbot certonly \
-                    --webroot -w /var/www/certbot \
-                    -d "$domain" -d "www.$domain" \
-                    --non-interactive --agree-tos \
-                    --register-unsafely-without-email \
-                    --keep-until-expiring; then
+              # POSIX sh: no arrays. Keep both branches explicit so a missing
+              # email cannot break issuance for a brand-new site.
+              if [ -n "${CERTBOT_EMAIL:-}" ]; then
+                docker compose run --rm --entrypoint certbot certbot certonly \
+                  --webroot -w /var/www/certbot \
+                  -d "$domain" -d "www.$domain" \
+                  --non-interactive --agree-tos \
+                  --email "$CERTBOT_EMAIL" --no-eff-email \
+                  --keep-until-expiring \
+                  && issued=yes || issued=no
+              else
+                docker compose run --rm --entrypoint certbot certbot certonly \
+                  --webroot -w /var/www/certbot \
+                  -d "$domain" -d "www.$domain" \
+                  --non-interactive --agree-tos \
+                  --register-unsafely-without-email \
+                  --keep-until-expiring \
+                  && issued=yes || issued=no
+              fi
+              if [ "$issued" = "yes" ]; then
                 mv "$pending" "conf.d/$domain.conf"
                 echo "Certificate issued for $domain."
               else
@@ -149,6 +151,16 @@ jobs:
             re-run this workflow. Other sites are unaffected."
               fi
             done
+
+            if [ -n "${CERTBOT_EMAIL:-}" ]; then
+              echo "Updating the Let's Encrypt account contact."
+              if ! docker compose run --rm --entrypoint certbot certbot update_account \
+                    --email "$CERTBOT_EMAIL" --no-eff-email --non-interactive; then
+                echo "::warning::Could not update the Let's Encrypt account email. Other sites are unaffected. Re-run this workflow after checking CERTBOT_EMAIL."
+              fi
+            else
+              echo "::warning::CERTBOT_EMAIL is not set, so Let's Encrypt will not send expiry notices. Add it as a repository secret (preferred) or variable, then re-run this workflow."
+            fi
 
             docker compose exec -T proxy nginx -t
             docker compose exec -T proxy nginx -s reload
