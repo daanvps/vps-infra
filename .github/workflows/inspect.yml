@@ -3,29 +3,209 @@ name: Inspect VPS
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
+# Read-only SSH. The token is not used.
+permissions: {}
+
+env:
+  INFRA_PATH: ${{ vars.VPS_INFRA_PATH || '/home/deploy/vps-infra' }}
 
 jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
+      - name: Probe public ports 80 and 443
+        id: probe
+        continue-on-error: true
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          python3 - <<'PY'
+          import os, socket, sys, urllib.request
+
+          host = os.environ.get("VPS_HOST", "")
+          if not host:
+              print("::error::VPS_HOST secret is empty")
+              sys.exit(1)
+
+          def tcp_open(port, timeout=10):
+              try:
+                  infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+              except socket.gaierror as exc:
+                  print(f"::warning::tcp/{port} name lookup failed ({type(exc).__name__})")
+                  return False
+              last = "unknown"
+              for family, socktype, proto, _, addr in infos:
+                  sock = socket.socket(family, socktype, proto)
+                  sock.settimeout(timeout)
+                  try:
+                      sock.connect(addr)
+                      print(f"tcp/{port}: reachable")
+                      return True
+                  except Exception as exc:
+                      last = type(exc).__name__
+                  finally:
+                      sock.close()
+              print(f"::warning::tcp/{port} unreachable ({last})")
+              return False
+
+          failed = False
+          if not tcp_open(80):
+              failed = True
+          if not tcp_open(443):
+              failed = True
+
+          http_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+          try:
+              with urllib.request.urlopen(f"http://{http_host}/healthz", timeout=10) as resp:
+                  body = resp.read(64)
+                  print(f"http/80 /healthz: {resp.status} {body!r}")
+                  if resp.status != 200 or body.strip() != b"ok":
+                      print("::warning::port 80 answered, but /healthz was not the edge proxy")
+                      failed = True
+          except Exception as exc:
+              print(f"::warning::http/80 /healthz failed ({type(exc).__name__})")
+              failed = True
+
+          if failed:
+              print("HTTP-01 certificate renewal needs public port 80. See README.")
+              sys.exit(1)
+          PY
+
       - name: Report the current VPS state
-        uses: appleboy/ssh-action@v1.0.3
+        id: report
+        continue-on-error: true
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        env:
+          INFRA_PATH: ${{ env.INFRA_PATH }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          envs: INFRA_PATH
           script: |
-            cd /home/deploy/vps-infra || exit 0
+            fail=0
+
+            echo "=== infra path ==="
+            echo "$INFRA_PATH"
+            if [ ! -d "$INFRA_PATH" ]; then
+              echo "::warning::VPS_INFRA_PATH is not a directory on the server"
+              fail=1
+            else
+              cd "$INFRA_PATH"
+              echo
+              echo "=== conf.d on disk ==="
+              ls -la conf.d/ conf.d/include/ 2>&1 || true
+              echo
+              echo "=== proxy logs ==="
+              docker compose logs proxy --tail 40 2>&1 || docker logs edge-proxy --tail 40 2>&1 || true
+            fi
+
+            echo
             echo "=== containers ==="
-            docker ps -a --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
+            docker ps -a --format '{{.Names}}\t{{.Status}}\t{{.Ports}}' || true
+
             echo
-            echo "=== proxy logs ==="
-            docker compose logs proxy --tail 40 2>&1 || docker logs edge-proxy --tail 40 2>&1
+            echo "=== listening sockets ==="
+            if command -v ss >/dev/null 2>&1; then
+              listeners=$(ss -lnt 2>/dev/null | grep -E ':(80|443)([^0-9]|$)' || true)
+              if [ -n "$listeners" ]; then
+                echo "$listeners"
+              else
+                echo "(ss shows nothing on 80 or 443)"
+              fi
+              echo "$listeners" | grep -Eq ':80([^0-9]|$)' || { echo "::warning::port 80 is not listening"; fail=1; }
+              echo "$listeners" | grep -Eq ':443([^0-9]|$)' || { echo "::warning::port 443 is not listening"; fail=1; }
+            else
+              echo "ss is not installed"
+            fi
+
             echo
-            echo "=== conf.d on disk ==="
-            ls -la conf.d/ conf.d/include/ 2>&1
+            echo "=== local healthz ==="
+            if command -v curl >/dev/null 2>&1; then
+              if curl -fsS --max-time 5 http://127.0.0.1/healthz; then
+                echo
+              else
+                echo "::warning::http://127.0.0.1/healthz failed on the VPS"
+                fail=1
+              fi
+            else
+              echo "curl is not installed"
+            fi
+
             echo
-            echo "=== certs ==="
-            ls /etc/letsencrypt/live/ 2>&1 || echo "(no read access)"
+            echo "=== firewall ==="
+            echo "-- ufw --"
+            if command -v ufw >/dev/null 2>&1; then
+              ufw status verbose 2>&1 || echo "(ufw status not permitted for this user)"
+            else
+              echo "ufw is not installed"
+            fi
+            echo "-- nft (first 120 lines) --"
+            if command -v nft >/dev/null 2>&1; then
+              nft list ruleset 2>&1 | head -n 120 || echo "(nft not permitted for this user)"
+            else
+              echo "nft is not installed"
+            fi
+            echo "-- iptables (first 120 lines) --"
+            if command -v iptables >/dev/null 2>&1; then
+              iptables -S 2>&1 | head -n 120 || echo "(iptables not permitted for this user)"
+            else
+              echo "iptables is not installed"
+            fi
+            echo "A provider firewall (cloud panel) is not visible here. The public port probe covers it."
+
+            echo
+            echo "=== certificate files ==="
+            ls /etc/letsencrypt/live/ 2>&1 || echo "(no direct read access; reading through the certbot container)"
+
+            echo
+            echo "=== certificate expiry ==="
+            # The nginx image has no openssl. The certbot image does, and it
+            # mounts /etc/letsencrypt.
+            if docker ps --format '{{.Names}}' | grep -qx edge-certbot; then
+              if ! docker exec edge-certbot sh -c '
+                status=0
+                found=0
+                for cert in /etc/letsencrypt/live/*/fullchain.pem; do
+                  [ -f "$cert" ] || continue
+                  found=1
+                  name=$(basename "$(dirname "$cert")")
+                  echo "--- $name ---"
+                  openssl x509 -in "$cert" -noout -subject -enddate || status=1
+                  if ! openssl x509 -in "$cert" -checkend 2592000 -noout >/dev/null 2>&1; then
+                    echo "::warning::$name expires within 30 days. HTTP-01 renewal needs public port 80."
+                    status=1
+                  elif ! openssl x509 -in "$cert" -checkend 3888000 -noout >/dev/null 2>&1; then
+                    echo "::warning::$name expires within 45 days. Renewal needs public port 80 once 30 days remain."
+                  else
+                    echo "more than 45 days remaining"
+                  fi
+                done
+                if [ "$found" -eq 0 ]; then
+                  echo "::warning::no certificates under /etc/letsencrypt/live"
+                  status=1
+                fi
+                exit $status
+              '; then
+                fail=1
+              fi
+            else
+              echo "::warning::edge-certbot is not running, so certificate expiry was not read"
+              fail=1
+            fi
+
+            if docker ps --format '{{.Names}}' | grep -qx edge-certbot; then
+              echo
+              echo "=== certbot certificates ==="
+              docker exec edge-certbot certbot certificates 2>&1 || echo "(certbot certificates failed)"
+            fi
+
+            exit "$fail"
+
+      - name: Fail the run when a check failed
+        if: always() && (steps.probe.outcome == 'failure' || steps.report.outcome == 'failure')
+        run: |
+          echo "Public port probe: ${{ steps.probe.outcome }}"
+          echo "VPS report: ${{ steps.report.outcome }}"
+          echo "HTTP-01 renewal needs public TCP port 80. Firewall output is in the VPS report. See the README."
+          exit 1
