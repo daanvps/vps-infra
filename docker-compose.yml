@@ -110,6 +110,11 @@ services:
       - db_superuser_password
     volumes:
       - ./backups:/backups
+    # The postgres image declares /var/lib/postgresql as a volume. This job
+    # never writes there; a tmpfs stops Docker creating an empty anonymous
+    # volume on every recreate.
+    tmpfs:
+      - /var/lib/postgresql
     networks:
       - db-net
     depends_on:
