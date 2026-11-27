@@ -1,0 +1,39 @@
+# Shared edge proxy. Caddy obtains and renews a certificate for every site
+# below by itself. Each site lives in its own file in sites/.
+{
+	# HTTP/3 needs UDP 443, which is not published. Stay on HTTP/1.1 and 2.
+	servers {
+		protocols h1 h2
+	}
+}
+
+# Headers and compression every site imports. Applications set their own
+# Content-Security-Policy; this snippet leaves that header alone.
+(common) {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options SAMEORIGIN
+		X-XSS-Protection "0"
+		-Server
+		-X-Powered-By
+		-X-AspNet-Version
+		-X-AspNetMvc-Version
+	}
+}
+
+# Plain HTTP for names that have no site: the health endpoint for the deploy
+# and inspect workflows; everything else is dropped. Configured sites still
+# get Caddy's automatic redirect to HTTPS.
+http:// {
+	handle /healthz {
+		respond "ok" 200
+	}
+	handle {
+		abort
+	}
+}
+
+import sites/*.caddy

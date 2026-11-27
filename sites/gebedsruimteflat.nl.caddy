@@ -1,0 +1,16 @@
+gebedsruimteflat.nl {
+	import common
+
+	# The Blazor client calls a relative /api/ path, so the API and the web
+	# container are split here.
+	handle /api/* {
+		reverse_proxy prayerroom-api:5000
+	}
+	handle {
+		reverse_proxy prayerroom-web:5001
+	}
+}
+
+www.gebedsruimteflat.nl {
+	redir https://gebedsruimteflat.nl{uri} permanent
+}

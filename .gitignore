@@ -1,2 +1,5 @@
 fake-le/
 *.pending
+# Created on the VPS, never committed.
+secrets/
+backups/

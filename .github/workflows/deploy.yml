@@ -1,14 +1,9 @@
-name: Deploy edge proxy
+name: Deploy edge proxy and database
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      issue_certs:
-        description: 'Request certificates for domains that do not have one yet'
-        type: boolean
-        default: true
 
 # Checkout only. SSH uses repository secrets, not the token.
 permissions:
@@ -28,7 +23,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Validate Compose and nginx configuration
+      - name: Validate Compose and Caddy configuration
         run: ./scripts/validate-config.sh
 
       - name: Prepare the VPS directory
@@ -37,27 +32,24 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          script: mkdir -p ${{ vars.VPS_INFRA_PATH || env.INFRA_PATH }}/conf.d/include
+          script: mkdir -p ${{ vars.VPS_INFRA_PATH || env.INFRA_PATH }}/sites ${{ vars.VPS_INFRA_PATH || env.INFRA_PATH }}/scripts
 
-      - name: Copy the proxy configuration to the VPS
+      - name: Copy the configuration to the VPS
         uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "docker-compose.yml,conf.d/**,scripts/**"
+          source: "docker-compose.yml,Caddyfile,sites/**,scripts/**"
           target: ${{ vars.VPS_INFRA_PATH || env.INFRA_PATH }}
           overwrite: true
 
-      - name: Deploy the proxy
+      - name: Deploy
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
-        env:
-          CERTBOT_EMAIL: ${{ secrets.CERTBOT_EMAIL || vars.CERTBOT_EMAIL }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          envs: CERTBOT_EMAIL
           script: |
             set -e
             cd ${{ vars.VPS_INFRA_PATH || env.INFRA_PATH }}
@@ -65,104 +57,38 @@ jobs:
             docker network inspect edge-net >/dev/null 2>&1 \
               || docker network create edge-net
 
-            # A vhost whose certificate is missing would stop nginx from
-            # starting, taking every other site down with it. Park those until
-            # certbot has issued one.
-            # /etc/letsencrypt is root owned, so list it through a container
-            # rather than testing paths as the deploy user, which cannot read it
-            # and would report every certificate as missing.
-            certs=$(docker run --rm -v /etc/letsencrypt:/etc/letsencrypt:ro \
-                      alpine sh -c 'ls /etc/letsencrypt/live 2>/dev/null' || true)
-            echo "Certificates present: ${certs:-<none>}"
+            sh scripts/init-secrets.sh
+            mkdir -p backups
 
-            # Restore anything parked by an earlier run before re-evaluating.
-            for pending in conf.d/*.conf.pending; do
-              [ -e "$pending" ] || continue
-              mv "$pending" "${pending%.pending}"
-            done
+            docker compose pull --quiet
 
-            for conf in conf.d/*.conf; do
-              [ "$(basename "$conf")" = "00-default.conf" ] && continue
-
-              # Only vhosts that reference a certificate can be broken by a
-              # missing one; plain HTTP vhosts are always safe to load.
-              cert=$(sed -n 's/^[[:space:]]*ssl_certificate[[:space:]]\+\([^;]*\);.*/\1/p' "$conf" | head -n1)
-              [ -n "$cert" ] || continue
-
-              name=$(basename "$conf" .conf)
-              if ! echo "$certs" | grep -qx "$name"; then
-                echo "No certificate for $name yet; parking its vhost."
-                mv "$conf" "$conf.pending"
-              fi
-            done
-
-            docker compose pull
-
-            # A site-specific nginx from before the shared proxy would still be
-            # holding :80/:443, so stand it down first. The proxy takes over in
-            # the same step, keeping the gap to a few seconds.
-            for legacy in prayerroom-nginx hartvoorelkaar-nginx; do
+            # The nginx + certbot proxy and the older site-specific proxies
+            # hold :80/:443. Stand them down right before Caddy takes over,
+            # keeping the gap to a few seconds. Their certificates stay in
+            # /etc/letsencrypt, so reverting this repo brings them back.
+            for legacy in edge-proxy edge-certbot prayerroom-nginx hartvoorelkaar-nginx; do
               if [ -n "$(docker ps -aq -f "name=^${legacy}$")" ]; then
                 echo "Removing legacy proxy container $legacy"
                 docker rm -f "$legacy" >/dev/null
               fi
             done
 
-            docker compose up -d --remove-orphans
+            docker compose up -d --remove-orphans --wait --wait-timeout 120
 
-            # Wait for the proxy to answer before issuing challenges through it.
+            # Bind-mounted files changing does not restart Caddy; reload so
+            # edited site files take effect. Caddy keeps the running config
+            # when the new one is invalid.
+            docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+
             for i in $(seq 1 30); do
               curl -fsS -o /dev/null http://127.0.0.1/healthz && break
-              [ "$i" -eq 30 ] && { echo "proxy did not become healthy"; docker compose logs proxy; exit 1; }
+              [ "$i" -eq 30 ] && { echo "proxy did not become healthy"; docker compose logs caddy --tail 60; exit 1; }
               sleep 1
             done
             echo "Proxy is healthy."
 
-            for pending in conf.d/*.conf.pending; do
-              [ -e "$pending" ] || continue
-              domain=$(basename "$pending" .conf.pending)
+            # Leftovers of the nginx setup.
+            rm -rf conf.d
 
-              echo "Requesting a certificate for $domain"
-              # POSIX sh: no arrays. Keep both branches explicit so a missing
-              # email cannot break issuance for a brand-new site.
-              if [ -n "${CERTBOT_EMAIL:-}" ]; then
-                docker compose run --rm --entrypoint certbot certbot certonly \
-                  --webroot -w /var/www/certbot \
-                  -d "$domain" -d "www.$domain" \
-                  --non-interactive --agree-tos \
-                  --email "$CERTBOT_EMAIL" --no-eff-email \
-                  --keep-until-expiring \
-                  && issued=yes || issued=no
-              else
-                docker compose run --rm --entrypoint certbot certbot certonly \
-                  --webroot -w /var/www/certbot \
-                  -d "$domain" -d "www.$domain" \
-                  --non-interactive --agree-tos \
-                  --register-unsafely-without-email \
-                  --keep-until-expiring \
-                  && issued=yes || issued=no
-              fi
-              if [ "$issued" = "yes" ]; then
-                mv "$pending" "conf.d/$domain.conf"
-                echo "Certificate issued for $domain."
-              else
-                echo "::warning::Could not obtain a certificate for $domain. \
-            Point the A records for $domain and www.$domain at this server, then \
-            re-run this workflow. Other sites are unaffected."
-              fi
-            done
-
-            if [ -n "${CERTBOT_EMAIL:-}" ]; then
-              echo "Updating the Let's Encrypt account contact."
-              if ! docker compose run --rm --entrypoint certbot certbot update_account \
-                    --email "$CERTBOT_EMAIL" --no-eff-email --non-interactive; then
-                echo "::warning::Could not update the Let's Encrypt account email. Other sites are unaffected. Re-run this workflow after checking CERTBOT_EMAIL."
-              fi
-            else
-              echo "::warning::CERTBOT_EMAIL is not set, so Let's Encrypt will not send expiry notices. Add it as a repository secret (preferred) or variable, then re-run this workflow."
-            fi
-
-            docker compose exec -T proxy nginx -t
-            docker compose exec -T proxy nginx -s reload
             echo "Active sites:"
-            ls conf.d/*.conf | xargs -n1 basename
+            ls sites/*.caddy | xargs -n1 basename

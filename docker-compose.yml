@@ -1,11 +1,9 @@
 services:
-  proxy:
-    # 1.27.5-alpine, pinned to the multi-arch index. Same bits as the
-    # previous floating 1.27-alpine tag on the day it was pinned.
-    image: nginx:1.27.5-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
-    container_name: edge-proxy
-    # Upper ceilings. Docker charges the memory only while nginx uses it.
-    # Normal use sits far under 256m; the cap stops a leak or a log flood.
+  caddy:
+    # 2.11.9-alpine, pinned to the multi-arch index.
+    image: caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
+    container_name: edge-caddy
+    # Upper ceilings. Docker charges the memory only while Caddy uses it.
     mem_limit: 256m
     memswap_limit: 256m
     cpus: "0.75"
@@ -22,46 +20,33 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./conf.d:/etc/nginx/conf.d:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
-      - certbot-webroot:/var/www/certbot
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./sites:/etc/caddy/sites:ro
+      # Certificates and ACME account. Losing this only means Caddy
+      # requests new certificates on the next start.
+      - caddy-data:/data
+      - caddy-config:/config
     networks:
       - edge-net
     restart: unless-stopped
-    # Certbot's deploy hook touches .renewed. Polling once a minute keeps
-    # the reload cheap; nginx -s reload is graceful. The flag is removed
-    # only after a successful reload so a failed reload is retried.
-    command: >
-      sh -c 'nginx -g "daemon off;" &
-             nginxpid=$${!};
-             while :; do
-               sleep 60;
-               if [ -f /var/www/certbot/.renewed ]; then
-                 if nginx -s reload; then
-                   rm -f /var/www/certbot/.renewed;
-                 else
-                   echo "nginx reload after renewal failed; will retry" >&2;
-                 fi;
-               fi;
-             done &
-             wait $${nginxpid}'
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 10s
 
-  certbot:
-    # v5.8.0, which is what certbot/certbot:latest resolved to when pinned.
-    image: certbot/certbot:v5.8.0@sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20
-    container_name: edge-certbot
-    # Renewal is a short Python spike. 384m is headroom over that spike,
-    # and swap is off so a stuck renew cannot thrash the disk.
-    mem_limit: 384m
-    memswap_limit: 384m
+  db:
+    # 18.7-alpine, pinned to the multi-arch index.
+    image: postgres:18.7-alpine@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71
+    container_name: shared-db
+    # Tuned for a 1 CPU / 2 GB VPS with a handful of small apps.
+    # Normal use sits around 50-100m; the cap stops a runaway query.
+    mem_limit: 256m
+    memswap_limit: 256m
     cpus: "0.50"
-    pids_limit: 64
+    pids_limit: 128
+    shm_size: 64m
     init: true
     security_opt:
       - no-new-privileges:true
@@ -70,26 +55,105 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    environment:
+      POSTGRES_USER: postgres
+      # Only used when the data directory is empty (first start).
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_superuser_password
+    secrets:
+      - db_superuser_password
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - max_connections=40
+      - -c
+      - password_encryption=scram-sha-256
     volumes:
-      - /etc/letsencrypt:/etc/letsencrypt
-      - certbot-webroot:/var/www/certbot
+      # Postgres 18 images keep PGDATA under /var/lib/postgresql/18/docker,
+      # so the volume is mounted one level up.
+      - shared-pgdata:/var/lib/postgresql
+    # No published port: db-net is internal, so only containers that join it
+    # can connect. Administer with `docker exec -it shared-db psql -U postgres`.
     networks:
-      - edge-net
+      - db-net
     restart: unless-stopped
-    # Keep each shell command on one line. A deeper indent under ">",
-    # the YAML folded scalar, keeps the line break, and the shell then
-    # tries to execute "--deploy-hook" on its own.
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  db-backup:
+    image: postgres:18.7-alpine@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71
+    container_name: shared-db-backup
+    mem_limit: 128m
+    memswap_limit: 128m
+    cpus: "0.25"
+    pids_limit: 32
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    secrets:
+      - db_superuser_password
+    volumes:
+      - ./backups:/backups
+    networks:
+      - db-net
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    # Dumps every database once a day and keeps 14 days. A dump is written to
+    # a temporary name first, so a failed run never replaces a good file.
     entrypoint: >
       sh -c 'trap exit TERM;
+             umask 022;
              while :; do
-               certbot renew --webroot -w /var/www/certbot --quiet --no-random-sleep-on-renew --deploy-hook "touch /var/www/certbot/.renewed";
-               sleep 12h & wait $${!};
+               PGPASSWORD=$$(cat /run/secrets/db_superuser_password);
+               export PGPASSWORD;
+               out=/backups/all-$$(date +%F).sql.gz;
+               if pg_dumpall -h shared-db -U postgres | gzip > "$$out.tmp"; then
+                 mv "$$out.tmp" "$$out";
+                 find /backups -name "all-*.sql.gz" -mtime +14 -delete;
+                 echo "backup written: $$out";
+               else
+                 rm -f "$$out.tmp";
+                 echo "backup failed" >&2;
+               fi;
+               sleep 24h & wait $${!};
              done'
 
+secrets:
+  # Created on the VPS by scripts/init-secrets.sh, never in git.
+  db_superuser_password:
+    file: ./secrets/db_superuser_password
+
 volumes:
-  certbot-webroot:
-    name: edge-certbot-webroot
+  caddy-data:
+    name: edge-caddy-data
+  caddy-config:
+    name: edge-caddy-config
+  shared-pgdata:
+    name: shared-pgdata
 
 networks:
   edge-net:
     external: true
+  # Apps that need the database join this network as an external network.
+  # internal: no route to the internet and no published ports.
+  db-net:
+    name: db-net
+    internal: true

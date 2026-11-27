@@ -3,7 +3,7 @@ name: Inspect VPS
 on:
   workflow_dispatch:
 
-# Read-only SSH. The token is not used.
+# Read-only: checks out this repo for the site list, then SSH.
 permissions: {}
 
 env:
@@ -12,7 +12,12 @@ env:
 jobs:
   inspect:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
       - name: Probe public ports 80 and 443
         id: probe
         continue-on-error: true
@@ -67,9 +72,36 @@ jobs:
               failed = True
 
           if failed:
-              print("HTTP-01 certificate renewal needs public port 80. See README.")
+              print("Ports 80 and 443 must be reachable from the internet. See README.")
               sys.exit(1)
           PY
+
+      - name: Check certificates from outside
+        id: certs
+        continue-on-error: true
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          set -u
+          status=0
+          # Every name a site file serves, apex and www.
+          names=$(sed -n 's/^\([A-Za-z0-9.-]\+\(, *[A-Za-z0-9.-]\+\)*\) *{$/\1/p' sites/*.caddy | tr ',' '\n' | tr -d ' ' | sort -u)
+          for name in $names; do
+            end=$(echo | timeout 15 openssl s_client -connect "${VPS_HOST}:443" -servername "$name" 2>/dev/null \
+                    | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+            if [ -z "$end" ]; then
+              echo "::warning::$name: no certificate served"
+              status=1
+              continue
+            fi
+            days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+            echo "$name: expires $end ($days days)"
+            if [ "$days" -lt 20 ]; then
+              echo "::warning::$name expires within 20 days; Caddy renews at about 30 days left, so renewal is failing. See the Caddy logs below."
+              status=1
+            fi
+          done
+          exit $status
 
       - name: Report the current VPS state
         id: report
@@ -93,11 +125,14 @@ jobs:
             else
               cd "$INFRA_PATH"
               echo
-              echo "=== conf.d on disk ==="
-              ls -la conf.d/ conf.d/include/ 2>&1 || true
+              echo "=== sites on disk ==="
+              ls -la sites/ 2>&1 || true
               echo
-              echo "=== proxy logs ==="
-              docker compose logs proxy --tail 40 2>&1 || docker logs edge-proxy --tail 40 2>&1 || true
+              echo "=== Caddy logs ==="
+              docker logs edge-caddy --tail 40 2>&1 || true
+              echo
+              echo "=== database backups ==="
+              ls -la backups/ 2>&1 | tail -n 16 || true
             fi
 
             echo
@@ -155,57 +190,17 @@ jobs:
             echo "A provider firewall (cloud panel) is not visible here. The public port probe covers it."
 
             echo
-            echo "=== certificate files ==="
-            ls /etc/letsencrypt/live/ 2>&1 || echo "(no direct read access; reading through the certbot container)"
-
-            echo
-            echo "=== certificate expiry ==="
-            # The nginx image has no openssl. The certbot image does, and it
-            # mounts /etc/letsencrypt.
-            if docker ps --format '{{.Names}}' | grep -qx edge-certbot; then
-              if ! docker exec edge-certbot sh -c '
-                status=0
-                found=0
-                for cert in /etc/letsencrypt/live/*/fullchain.pem; do
-                  [ -f "$cert" ] || continue
-                  found=1
-                  name=$(basename "$(dirname "$cert")")
-                  echo "--- $name ---"
-                  openssl x509 -in "$cert" -noout -subject -enddate || status=1
-                  if ! openssl x509 -in "$cert" -checkend 2592000 -noout >/dev/null 2>&1; then
-                    echo "::warning::$name expires within 30 days. HTTP-01 renewal needs public port 80."
-                    status=1
-                  elif ! openssl x509 -in "$cert" -checkend 3888000 -noout >/dev/null 2>&1; then
-                    echo "::warning::$name expires within 45 days. Renewal needs public port 80 once 30 days remain."
-                  else
-                    echo "more than 45 days remaining"
-                  fi
-                done
-                if [ "$found" -eq 0 ]; then
-                  echo "::warning::no certificates under /etc/letsencrypt/live"
-                  status=1
-                fi
-                exit $status
-              '; then
-                fail=1
-              fi
-            else
-              echo "::warning::edge-certbot is not running, so certificate expiry was not read"
-              fail=1
-            fi
-
-            if docker ps --format '{{.Names}}' | grep -qx edge-certbot; then
-              echo
-              echo "=== certbot certificates ==="
-              docker exec edge-certbot certbot certificates 2>&1 || echo "(certbot certificates failed)"
-            fi
+            echo "=== database ==="
+            docker exec shared-db pg_isready -U postgres 2>&1 || { echo "::warning::shared-db is not ready"; fail=1; }
+            docker exec shared-db psql -U postgres -At -c "select datname from pg_database where not datistemplate and datname <> 'postgres' order by 1" 2>&1 || true
 
             exit "$fail"
 
       - name: Fail the run when a check failed
-        if: always() && (steps.probe.outcome == 'failure' || steps.report.outcome == 'failure')
+        if: always() && (steps.probe.outcome == 'failure' || steps.certs.outcome == 'failure' || steps.report.outcome == 'failure')
         run: |
           echo "Public port probe: ${{ steps.probe.outcome }}"
+          echo "Certificates: ${{ steps.certs.outcome }}"
           echo "VPS report: ${{ steps.report.outcome }}"
-          echo "HTTP-01 renewal needs public TCP port 80. Firewall output is in the VPS report. See the README."
+          echo "Firewall output and Caddy logs are in the VPS report. See the README."
           exit 1

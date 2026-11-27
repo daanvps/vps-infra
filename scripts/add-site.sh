@@ -1,54 +1,30 @@
-#!/usr/bin/env bash
-# Scaffold a vhost for a new site.
+#!/bin/sh
+# Scaffolds a site file for a site whose configuration lives in this repo.
 #
 #   ./scripts/add-site.sh example.nl example-web 8080
 #
-# Then commit the generated file and push; the deploy workflow issues the
-# certificate and reloads the proxy.
-set -euo pipefail
+# Commit the file and push; the deploy workflow reloads Caddy, which
+# requests the certificate by itself. Apps can also ship their own site file
+# with scripts/apply-site.sh instead (see the README).
+set -eu
 
 domain=${1:?usage: add-site.sh <domain> <container> [port]}
 container=${2:?usage: add-site.sh <domain> <container> [port]}
 port=${3:-8080}
 
-target="$(dirname "$0")/../conf.d/${domain}.conf"
+target="$(dirname "$0")/../sites/${domain}.caddy"
+[ -e "$target" ] && { echo "error: $target already exists" >&2; exit 1; }
 
-if [ -e "$target" ]; then
-    echo "error: $target already exists" >&2
-    exit 1
-fi
-
-cat > "$target" <<EOF
-server {
-    listen 80;
-    server_name ${domain} www.${domain};
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
+cat > "$target" <<SITE
+${domain} {
+	import common
+	reverse_proxy ${container}:${port}
 }
 
-server {
-    listen 443 ssl;
-    http2 on;
-    server_name ${domain} www.${domain};
-
-    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    include /etc/nginx/conf.d/include/tls.conf;
-
-    location / {
-        resolver 127.0.0.11 valid=10s;
-        set \$upstream http://${container}:${port};
-        proxy_pass \$upstream;
-        include /etc/nginx/conf.d/include/proxy.conf;
-    }
+www.${domain} {
+	redir https://${domain}{uri} permanent
 }
-EOF
+SITE
 
 echo "Created $target"
-echo "Ensure '${container}' joins the edge-net network, then commit and push."
+echo "Make sure '${container}' joins the edge-net network, then commit and push."
