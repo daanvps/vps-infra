@@ -1,34 +1,30 @@
 #!/usr/bin/env bash
-# Validate docker-compose.yml and the nginx configuration.
-# Vhosts reference certificates that exist only on the VPS, so stub them.
+# Validates docker-compose.yml and the Caddy configuration.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
 echo "Validating docker-compose.yml"
+# The secret file only exists on the VPS; give Compose a placeholder.
+mkdir -p secrets
+created_secret=false
+if [ ! -e secrets/db_superuser_password ]; then
+    echo placeholder > secrets/db_superuser_password
+    created_secret=true
+fi
+trap '$created_secret && rm -f secrets/db_superuser_password' EXIT
 docker compose config --quiet
 
-workdir=$(mktemp -d)
-trap 'rm -rf "$workdir"' EXIT
-
-shopt -s nullglob
-for conf in conf.d/*.conf; do
-  if ! grep -qE '^[[:space:]]*ssl_certificate[[:space:]]' "$conf"; then
-    continue
-  fi
-  domain=$(basename "$conf" .conf)
-  mkdir -p "$workdir/live/$domain"
-  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-    -keyout "$workdir/live/$domain/privkey.pem" \
-    -out "$workdir/live/$domain/fullchain.pem" \
-    -subj "/CN=$domain" 2>/dev/null
-  echo "stubbed certificate for $domain"
-done
-
-image=$(docker compose config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["proxy"]["image"])')
-echo "Testing nginx config with ${image}"
+image=$(docker compose config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["caddy"]["image"])')
+echo "Validating the Caddyfile with ${image}"
 docker run --rm \
-  -v "$root/conf.d:/etc/nginx/conf.d:ro" \
-  -v "$workdir:/etc/letsencrypt:ro" \
-  "$image" nginx -t
+  -v "$root/Caddyfile:/etc/caddy/Caddyfile:ro" \
+  -v "$root/sites:/etc/caddy/sites:ro" \
+  "$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+echo "Checking formatting"
+for f in Caddyfile sites/*.caddy; do
+  docker run --rm -i "$image" caddy fmt - < "$f" | diff -u "$f" - \
+    || { echo "$f is not formatted; run: caddy fmt --overwrite $f" >&2; exit 1; }
+done

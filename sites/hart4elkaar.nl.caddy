@@ -1,0 +1,8 @@
+hart4elkaar.nl {
+	import common
+	reverse_proxy hartvoorelkaar-web:8080
+}
+
+www.hart4elkaar.nl {
+	redir https://hart4elkaar.nl{uri} permanent
+}
